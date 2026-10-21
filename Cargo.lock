@@ -1910,6 +1910,7 @@ dependencies = [
  "letter-docx",
  "letter-editor",
  "letter-layout",
+ "letter-model",
  "letter-render",
  "rfd",
 ]

@@ -13,7 +13,6 @@ workspace = true
 
 [dependencies]
 letter-layout.workspace = true
+letter-model.workspace = true
 unicode-segmentation = "1"
 
-[dev-dependencies]
-letter-model.workspace = true

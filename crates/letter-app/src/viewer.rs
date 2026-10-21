@@ -9,11 +9,15 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use eframe::egui::{
-    self, Align, Align2, Color32, Context, CursorIcon, Key, KeyboardShortcut, Layout, Modifiers,
-    Pos2, Rect, Sense, Vec2, ViewportCommand, emath::GuiRounding,
+    self, Align, Align2, Color32, Context, CursorIcon, ImeEvent, Key, KeyboardShortcut, Layout,
+    Modifiers, Pos2, Rect, Sense, Vec2, ViewportCommand, emath::GuiRounding, output::IMEOutput,
 };
-use letter_editor::{Motion, Position, caret, hit_test, move_cursor};
+use letter_editor::{
+    Insert, Motion, Position, caret, delete_backward, delete_forward, hit_test, insert,
+    move_cursor, split_paragraph,
+};
 use letter_layout::{DocumentLayout, FontLibrary, Shaper, layout_document};
+use letter_model::Document;
 use letter_render::{DESK_COLOR, PagePainter, SCREEN_PIXELS_PER_POINT};
 
 use crate::view::{
@@ -59,6 +63,18 @@ struct OpenDocument {
     cursor_since: f64,
     /// Колонка для ↑ и ↓ (см. [`letter_editor::Moved::goal_x`]).
     goal_x: Option<f32>,
+    /// Документ: правки идут в него, потом он верстается заново.
+    doc: Document,
+    /// Слово, которое набирается в IME (китайский, японский): ещё не
+    /// в документе, показывается у курсора.
+    preedit: String,
+}
+
+impl OpenDocument {
+    /// Верстает документ заново после правки.
+    fn relayout(&mut self, shaper: &mut Shaper, library: &FontLibrary) {
+        self.layout = layout_document(&self.doc, shaper, library);
+    }
 }
 
 /// Состояние окна просмотра.
@@ -116,6 +132,8 @@ impl Viewer {
             cursor: Position::default(),
             cursor_since: 0.0,
             goal_x: None,
+            doc,
+            preedit: String::new(),
         });
         self.pending_offset = Some(Vec2::ZERO);
         self.current_page = 0;
@@ -240,42 +258,69 @@ impl Viewer {
             self.open_or_report(&path);
         }
         if self.error.is_none() {
-            self.move_cursor_by_keys(ctx);
+            self.keyboard(ctx);
         }
     }
 
-    /// Стрелки, Home/End, PageUp/PageDown двигают курсор.
-    fn move_cursor_by_keys(&mut self, ctx: &Context) {
+    /// Клавиатура: перемещение курсора, ввод и удаление текста.
+    fn keyboard(&mut self, ctx: &Context) {
         let points = 1.0 / (self.zoom() * SCREEN_PIXELS_PER_POINT);
         let screen = self.view_size.y * points;
         let Some(document) = &mut self.document else {
             return;
         };
-        let motions = ctx.input_mut(|i| {
-            let mut motions = Vec::new();
-            i.events.retain(|event| {
-                if let egui::Event::Key {
-                    key,
-                    pressed: true,
-                    modifiers,
-                    ..
-                } = event
-                    && let Some(motion) = key_motion(*key, *modifiers, screen)
-                {
-                    motions.push(motion);
-                    return false;
+        let actions = ctx.input_mut(|i| {
+            let mut actions = Vec::new();
+            i.events.retain(|event| match event_action(event, screen) {
+                Some(action) => {
+                    actions.push(action);
+                    false
                 }
-                true
+                None => true,
             });
-            motions
+            actions
         });
-        if motions.is_empty() {
+        if actions.is_empty() {
             return;
         }
-        for motion in motions {
-            let moved = move_cursor(&document.layout, document.cursor, motion, document.goal_x);
-            document.cursor = moved.position;
-            document.goal_x = moved.goal_x;
+        let mut stale = false;
+        for action in actions {
+            let at = document.cursor;
+            let doc = &mut document.doc;
+            let edited = match action {
+                Action::Move(motion) => {
+                    if std::mem::take(&mut stale) {
+                        document.relayout(&mut self.shaper, &self.library);
+                    }
+                    let moved =
+                        move_cursor(&document.layout, document.cursor, motion, document.goal_x);
+                    document.cursor = moved.position;
+                    document.goal_x = moved.goal_x;
+                    continue;
+                }
+                Action::Preedit(text) => {
+                    document.preedit = text;
+                    continue;
+                }
+                Action::Insert(text) => {
+                    document.preedit.clear();
+                    insert(doc, at, Insert::Text(&text))
+                }
+                Action::Tab => insert(doc, at, Insert::Tab),
+                Action::LineBreak => insert(doc, at, Insert::LineBreak),
+                Action::PageBreak => insert(doc, at, Insert::PageBreak),
+                Action::Enter => split_paragraph(doc, at),
+                Action::Backspace => delete_backward(doc, at),
+                Action::Delete => delete_forward(doc, at),
+            };
+            if let Some(position) = edited {
+                document.cursor = position;
+                document.goal_x = None;
+                stale = true;
+            }
+        }
+        if stale {
+            document.relayout(&mut self.shaper, &self.library);
         }
         document.cursor_since = ctx.input(|i| i.time);
         self.reveal_cursor = true;
@@ -480,22 +525,54 @@ impl Viewer {
                 }
             }
 
-            if let Some(c) = caret(&document.layout, document.cursor) {
-                let (shown, next) = caret_phase(now - document.cursor_since);
-                if shown && c.page < placement.rects.len() {
-                    let page = screen_rect(c.page);
-                    let scale = 1.0 / points;
-                    // Курсор — один пиксель экрана шириной.
-                    let x = (page.min.x + c.x * scale).round_to_pixels(ppp);
-                    let top = page.min.y + c.top * scale;
-                    let bar = Rect::from_min_max(
-                        Pos2::new(x, top),
-                        Pos2::new(x + 1.0 / ppp, top + c.height * scale),
+            if let Some(c) = caret(&document.layout, document.cursor)
+                && c.page < placement.rects.len()
+            {
+                let page = screen_rect(c.page);
+                let scale = 1.0 / points;
+                // Курсор — один пиксель экрана шириной.
+                let x = (page.min.x + c.x * scale).round_to_pixels(ppp);
+                let top = page.min.y + c.top * scale;
+                let mut bar = Rect::from_min_max(
+                    Pos2::new(x, top),
+                    Pos2::new(x + 1.0 / ppp, top + c.height * scale),
+                );
+                // Недонабранное в IME слово — подчёркнутое, курсор после него.
+                if !document.preedit.is_empty() {
+                    let font = egui::FontId::proportional(c.height * scale * 0.8);
+                    let text = ui.painter().text(
+                        bar.left_center(),
+                        Align2::LEFT_CENTER,
+                        &document.preedit,
+                        font,
+                        Color32::BLACK,
                     );
+                    ui.painter().hline(
+                        text.x_range(),
+                        bar.max.y,
+                        egui::Stroke::new(1.0, Color32::BLACK),
+                    );
+                    bar = bar.translate(Vec2::new(text.width(), 0.0));
+                }
+                let (shown, next) = caret_phase(now - document.cursor_since);
+                if shown {
                     ui.painter().rect_filled(bar, 0.0, Color32::BLACK);
                 }
                 ui.ctx()
                     .request_repaint_after(Duration::from_secs_f64(next.max(0.01)));
+                // Окно IME (выбор иероглифов) — у курсора.
+                let to_global = ui
+                    .ctx()
+                    .layer_transform_to_global(ui.layer_id())
+                    .unwrap_or_default();
+                ui.output_mut(|o| {
+                    o.ime = Some(IMEOutput {
+                        purpose: egui::IMEPurpose::Normal,
+                        rect: to_global * viewport.translate(origin.to_vec2()),
+                        cursor_rect: to_global * bar,
+                        should_interrupt_composition: false,
+                    });
+                });
             }
         });
         self.offset = output.state.clamped_offset();
@@ -525,14 +602,75 @@ impl Viewer {
     }
 }
 
-/// Клавиша перемещения курсора и что она делает. `screen` — сколько
-/// пунктов документа видно на экране по высоте (для PageUp/PageDown).
-fn key_motion(key: Key, modifiers: Modifiers, screen: f32) -> Option<Motion> {
-    // Alt — для меню, Shift пока двигает курсор так же (выделение — F3.4).
+/// Что делает нажатие клавиши или ввод.
+#[derive(Debug, Clone, PartialEq)]
+enum Action {
+    /// Передвинуть курсор.
+    Move(Motion),
+    /// Вставить буквы (с клавиатуры или готовое слово из IME).
+    Insert(String),
+    /// Недонабранное в IME слово: показывается у курсора, в документ
+    /// не входит.
+    Preedit(String),
+    /// Tab.
+    Tab,
+    /// Shift+Enter.
+    LineBreak,
+    /// Ctrl+Enter.
+    PageBreak,
+    /// Enter.
+    Enter,
+    /// Backspace.
+    Backspace,
+    /// Delete.
+    Delete,
+}
+
+/// Действие для события ввода. `screen` — сколько пунктов документа
+/// видно на экране по высоте (для PageUp/PageDown).
+fn event_action(event: &egui::Event, screen: f32) -> Option<Action> {
+    match event {
+        egui::Event::Key {
+            key,
+            pressed: true,
+            modifiers,
+            ..
+        } => key_action(*key, *modifiers, screen),
+        egui::Event::Text(text) => {
+            // Управляющие знаки приходят клавишами, а не текстом.
+            let text: String = text.chars().filter(|c| !c.is_control()).collect();
+            (!text.is_empty()).then_some(Action::Insert(text))
+        }
+        egui::Event::Ime(ImeEvent::Preedit { text, .. }) => Some(Action::Preedit(text.clone())),
+        egui::Event::Ime(ImeEvent::Commit(text)) => Some(Action::Insert(text.clone())),
+        _ => None,
+    }
+}
+
+/// Действие клавиши.
+fn key_action(key: Key, modifiers: Modifiers, screen: f32) -> Option<Action> {
+    // Alt — для меню.
     if modifiers.alt {
         return None;
     }
     let ctrl = modifiers.command;
+    if let Some(motion) = key_motion(key, ctrl, screen) {
+        return Some(Action::Move(motion));
+    }
+    Some(match key {
+        Key::Enter if ctrl => Action::PageBreak,
+        Key::Enter if modifiers.shift => Action::LineBreak,
+        Key::Enter => Action::Enter,
+        Key::Backspace if !ctrl => Action::Backspace,
+        Key::Delete if !ctrl => Action::Delete,
+        Key::Tab if !ctrl && !modifiers.shift => Action::Tab,
+        _ => return None,
+    })
+}
+
+/// Клавиша перемещения курсора и что она делает. Shift пока двигает
+/// курсор так же (выделение — F3.4).
+fn key_motion(key: Key, ctrl: bool, screen: f32) -> Option<Motion> {
     Some(match key {
         Key::ArrowLeft if ctrl => Motion::WordLeft,
         Key::ArrowLeft => Motion::Left,
@@ -785,34 +923,43 @@ mod tests {
     }
 
     #[test]
-    fn keys_map_to_motions() {
+    fn keys_map_to_actions() {
         let ctrl = Modifiers::COMMAND;
+        let none = Modifiers::NONE;
+        let motion = |key, modifiers| match key_action(key, modifiers, 500.0) {
+            Some(Action::Move(m)) => Some(m),
+            _ => None,
+        };
+        assert_eq!(motion(Key::ArrowLeft, none), Some(Motion::Left));
+        assert_eq!(motion(Key::ArrowRight, ctrl), Some(Motion::WordRight));
+        assert_eq!(motion(Key::ArrowDown, ctrl), Some(Motion::ParagraphDown));
+        assert_eq!(motion(Key::Home, ctrl), Some(Motion::DocumentStart));
+        assert_eq!(motion(Key::End, none), Some(Motion::LineEnd));
+        assert_eq!(motion(Key::PageDown, none), Some(Motion::ScreenDown(500.0)));
+        assert_eq!(key_action(Key::ArrowLeft, Modifiers::ALT, 0.0), None);
+        assert_eq!(key_action(Key::A, none, 0.0), None);
+
+        assert_eq!(key_action(Key::Enter, none, 0.0), Some(Action::Enter));
         assert_eq!(
-            key_motion(Key::ArrowLeft, Modifiers::NONE, 0.0),
-            Some(Motion::Left)
+            key_action(Key::Enter, Modifiers::SHIFT, 0.0),
+            Some(Action::LineBreak)
         );
+        assert_eq!(key_action(Key::Enter, ctrl, 0.0), Some(Action::PageBreak));
+        assert_eq!(key_action(Key::Tab, none, 0.0), Some(Action::Tab));
         assert_eq!(
-            key_motion(Key::ArrowRight, ctrl, 0.0),
-            Some(Motion::WordRight)
+            key_action(Key::Backspace, none, 0.0),
+            Some(Action::Backspace)
         );
+        assert_eq!(key_action(Key::Delete, none, 0.0), Some(Action::Delete));
+
+        let text = |t: &str| event_action(&Event::Text(t.into()), 0.0);
+        assert_eq!(text("ж"), Some(Action::Insert("ж".into())));
+        assert_eq!(text("\r"), None);
+        let commit = Event::Ime(ImeEvent::Commit("漢字".into()));
         assert_eq!(
-            key_motion(Key::ArrowDown, ctrl, 0.0),
-            Some(Motion::ParagraphDown)
+            event_action(&commit, 0.0),
+            Some(Action::Insert("漢字".into()))
         );
-        assert_eq!(
-            key_motion(Key::Home, ctrl, 0.0),
-            Some(Motion::DocumentStart)
-        );
-        assert_eq!(
-            key_motion(Key::End, Modifiers::NONE, 0.0),
-            Some(Motion::LineEnd)
-        );
-        assert_eq!(
-            key_motion(Key::PageDown, Modifiers::NONE, 500.0),
-            Some(Motion::ScreenDown(500.0))
-        );
-        assert_eq!(key_motion(Key::ArrowLeft, Modifiers::ALT, 0.0), None);
-        assert_eq!(key_motion(Key::A, Modifiers::NONE, 0.0), None);
     }
 
     #[test]
@@ -857,5 +1004,66 @@ mod tests {
         }
         assert_eq!(viewer.cursor(), Some(Position::default()));
         assert_eq!(viewer.current_page, 0);
+    }
+
+    fn text(text: &str) -> RawInput {
+        let mut input = screen();
+        input.events = vec![Event::Text(text.into())];
+        input
+    }
+
+    fn paragraphs(viewer: &Viewer) -> Vec<String> {
+        let doc = &viewer.document.as_ref().unwrap().doc;
+        doc.plain_text().split('\n').map(str::to_owned).collect()
+    }
+
+    #[test]
+    fn typing_edits_the_document() {
+        let ctx = Context::default();
+        let mut viewer = Viewer::new(FontLibrary::embedded_only());
+        viewer.open(&fixture("plain-text.docx")).unwrap();
+        frame(&ctx, &mut viewer, screen());
+        let before = paragraphs(&viewer);
+
+        frame(&ctx, &mut viewer, text("Привет"));
+        frame(&ctx, &mut viewer, key(Key::Tab, Modifiers::NONE));
+        frame(&ctx, &mut viewer, key(Key::Enter, Modifiers::NONE));
+        assert_eq!(viewer.cursor(), Some(Position::new(1, 0)));
+        let after = paragraphs(&viewer);
+        assert_eq!(after[0], "Привет\t");
+        assert_eq!(after[1], before[0]);
+        // Вёрстка пересчитана: первая строка — новый текст.
+        let layout = &viewer.document.as_ref().unwrap().layout;
+        assert_eq!(&*layout.pages[0].lines[0].text, "Привет\t");
+
+        // Backspace соединяет абзацы обратно, ещё семь — стирают ввод.
+        for _ in 0..8 {
+            frame(&ctx, &mut viewer, key(Key::Backspace, Modifiers::NONE));
+        }
+        assert_eq!(paragraphs(&viewer), before);
+        assert_eq!(viewer.cursor(), Some(Position::new(0, 0)));
+
+        // IME: недонабранное слово не входит в документ, готовое — входит.
+        let mut input = screen();
+        input.events = vec![Event::Ime(ImeEvent::Preedit {
+            text: "かん".into(),
+            active_range_chars: None,
+        })];
+        frame(&ctx, &mut viewer, input);
+        assert_eq!(paragraphs(&viewer), before);
+        assert_eq!(viewer.document.as_ref().unwrap().preedit, "かん");
+        let mut input = screen();
+        input.events = vec![Event::Ime(ImeEvent::Commit("漢".into()))];
+        frame(&ctx, &mut viewer, input);
+        assert!(paragraphs(&viewer)[0].starts_with('漢'));
+        assert!(viewer.document.as_ref().unwrap().preedit.is_empty());
+
+        // Правленый документ сохраняется и открывается тем же.
+        frame(&ctx, &mut viewer, key(Key::Enter, Modifiers::SHIFT));
+        let doc = &viewer.document.as_ref().unwrap().doc;
+        let bytes = letter_docx::write_bytes(doc).unwrap();
+        let reread = letter_docx::read_bytes(&bytes).unwrap();
+        assert_eq!(reread.plain_text(), doc.plain_text());
+        assert!(reread.plain_text().starts_with("漢\n"));
     }
 }

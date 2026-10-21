@@ -19,6 +19,7 @@ path = "src/main.rs"
 eframe.workspace = true
 letter-docx.workspace = true
 letter-editor.workspace = true
+letter-model.workspace = true
 letter-layout.workspace = true
 letter-render.workspace = true
 # Системное окно выбора файла (Windows, macOS, Linux через XDG-портал).
