@@ -17,3 +17,8 @@ path = "src/main.rs"
 
 [dependencies]
 eframe.workspace = true
+letter-docx.workspace = true
+letter-layout.workspace = true
+letter-model.workspace = true
+letter-render.workspace = true
+rfd = "0.17"
