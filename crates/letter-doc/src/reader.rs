@@ -10,11 +10,11 @@ use letter_model::{
     TableWidth, Twips,
 };
 
-use crate::fib::{Fib, Stories, index, plc, u16_at, u32_at};
+use crate::fib::{self, Fib, Stories, Word6, index, plc, u16_at, u32_at};
 use crate::pictures::{self, Drawings, Media};
 use crate::sprm::{Sep, TableMarks, apply_chp, apply_pap, apply_sep, sprms};
 use crate::styles::{ISTD_NIL, StyleSheet, builtin_name, fonts, style_id};
-use crate::{ReadError, links, lists, properties};
+use crate::{ReadError, crypto, links, lists, properties, word6};
 
 /// Самый большой поток, который мы согласны прочитать (512 МБ).
 const MAX_STREAM_SIZE: u64 = 512 * 1024 * 1024;
@@ -72,40 +72,102 @@ struct Range {
     grpprl: Vec<u8>,
 }
 
-pub(crate) fn read(data: &[u8]) -> Result<Document, ReadError> {
+/// Читает документ; `password` нужен, если документ зашифрован.
+pub(crate) fn read(data: &[u8], password: Option<&str>) -> Result<Document, ReadError> {
     let mut file = open(data).map_err(|_| ReadError::NotADoc)?;
-    let word = stream(&mut file, "/WordDocument")?;
-    let fib = Fib::read(&word)?;
-    let table = stream(&mut file, if fib.table_1 { "/1Table" } else { "/0Table" })?;
+    let mut word = stream(&mut file, "/WordDocument")?;
+    // Где таблицы — видно и в зашифрованном заголовке: первые его байты
+    // не шифруются.
+    let table_1 = u16_at(&word, 10).is_some_and(|flags| flags & 0x0200 != 0);
+    // У Word 6/95 таблицы лежат в самом потоке `WordDocument`.
+    let word6 = fib::is_word6(&word);
+    let mut table = if word6 {
+        Vec::new()
+    } else {
+        stream(&mut file, if table_1 { "/1Table" } else { "/0Table" })?
+    };
     // Картинок, рисунков и сведений может не быть — это не ошибка.
-    let data = stream(&mut file, "/Data").unwrap_or_default();
+    let mut data = stream(&mut file, "/Data").unwrap_or_default();
     let summary = stream(&mut file, "/\u{5}SummaryInformation").unwrap_or_default();
+    if crypto::is_encrypted(&word) {
+        let password = password.ok_or(ReadError::Encrypted)?;
+        let cipher = crypto::cipher(&word, &table, word6)?;
+        let plain = if word6 {
+            crypto::PLAIN_HEADER_WORD6
+        } else {
+            crypto::PLAIN_HEADER
+        };
+        crypto::decrypt(&cipher, password, plain, &mut word, &mut table, &mut data)?;
+    }
+    let fib = Fib::read(&word)?;
+    if word6 {
+        table.clone_from(&word);
+    }
 
-    let fonts = fib
-        .part(&table, index::STTBF_FFN)
-        .map(fonts)
-        .unwrap_or_default();
+    let old = fib.word6.as_ref();
+    let font_table = fib.part(&table, index::STTBF_FFN).unwrap_or_default();
+    let (fonts, charsets) = match old {
+        Some(_) => word6::fonts(font_table)
+            .into_iter()
+            .map(|f| (f.name, f.charset))
+            .unzip(),
+        None => (fonts(font_table), Vec::new()),
+    };
     let sheet = fib
         .part(&table, index::STSHF)
-        .map(StyleSheet::read)
+        .map(|bytes| StyleSheet::read(bytes, old.is_some()))
         .unwrap_or_default();
-    let clx = fib
-        .part(&table, index::CLX)
-        .ok_or_else(|| ReadError::Corrupt("нет таблицы кусков текста".into()))?;
-    let (pieces, prcs) = read_clx(clx)?;
-    let chars = read_chars(&word, &pieces, fib.stories.total());
+    let (pieces, prcs) = match (fib.part(&table, index::CLX), old) {
+        (Some(clx), _) => read_clx(clx, old.map(|old| old.unicode))?,
+        // Без таблицы кусков текст Word 6 идёт одним куском.
+        (None, Some(old)) => (
+            vec![Piece {
+                cp_start: 0,
+                cp_end: fib.stories.total(),
+                fc: old.fc_min,
+                compressed: true,
+                prc: None,
+            }],
+            Vec::new(),
+        ),
+        (None, None) => return Err(ReadError::Corrupt("нет таблицы кусков текста".into())),
+    };
     let chpx = fib
         .part(&table, index::PLCF_BTE_CHPX)
-        .map(|plc| read_fkps(&word, plc, false))
+        .map(|plc| read_fkps(&word, plc, false, old))
         .unwrap_or_default();
     let papx = fib
         .part(&table, index::PLCF_BTE_PAPX)
-        .map(|plc| read_fkps(&word, plc, true))
+        .map(|plc| read_fkps(&word, plc, true, old))
         .unwrap_or_default();
-    let sections = fib
+    let chars = match old {
+        None => read_chars(&word, &pieces, fib.stories.total(), &|byte, _| cp1252(byte)),
+        Some(old) => {
+            let decode = |byte: u8, fc: u32| {
+                let font = font_at(fc, &chpx, &papx, &sheet);
+                let encoding = charsets
+                    .get(usize::from(font))
+                    .and_then(|&c| word6::charset_encoding(c))
+                    .unwrap_or(old.encoding);
+                decode_byte(byte, encoding)
+            };
+            read_chars(&word, &pieces, fib.stories.total(), &decode)
+        }
+    };
+    let sepxs = fib
         .part(&table, index::PLCF_SED)
-        .map(|plc| read_sections(&word, plc))
+        .map(|plc| read_sepxs(&word, plc, old.is_some()))
         .unwrap_or_default();
+    let sections = sepxs
+        .iter()
+        .map(|(cp, grpprl)| {
+            let mut sep = Sep::default();
+            for (sprm, op) in sprms(grpprl) {
+                apply_sep(&mut sep, sprm, op);
+            }
+            (*cp, sep)
+        })
+        .collect::<Vec<_>>();
 
     let notes = Notes::read(&fib, &table);
     let headers = fib
@@ -113,12 +175,27 @@ pub(crate) fn read(data: &[u8]) -> Result<Document, ReadError> {
         .and_then(|bytes| plc(bytes, 0))
         .map(|(positions, _)| positions)
         .unwrap_or_default();
+    let dop = fib.part(&table, index::DOP).unwrap_or_default();
+    let headers = match old {
+        None => headers,
+        Some(_) => {
+            let flags: Vec<u8> = sepxs
+                .iter()
+                .map(|(_, grpprl)| {
+                    sprms(grpprl)
+                        .into_iter()
+                        .rev()
+                        .find(|(sprm, _)| *sprm == word6::GPRF_IHDT)
+                        .and_then(|(_, op)| op.first().copied())
+                        .unwrap_or(0)
+                })
+                .collect();
+            word6::expand_headers(&headers, dop.get(1).copied().unwrap_or(0), &flags)
+        }
+    };
 
     // «Различать колонтитулы чётных и нечётных страниц» — первый бит `Dop`.
-    let even_and_odd = fib
-        .part(&table, index::DOP)
-        .and_then(|dop| dop.first())
-        .is_some_and(|b| b & 1 != 0);
+    let even_and_odd = dop.first().is_some_and(|b| b & 1 != 0);
 
     let drawings = fib
         .part(&table, index::DGG_INFO)
@@ -174,14 +251,20 @@ pub(crate) fn read(data: &[u8]) -> Result<Document, ReadError> {
 }
 
 /// Таблица кусков (`Clx`): добавочное оформление (`Prc`) и куски
-/// (`Pcdt`).
-fn read_clx(clx: &[u8]) -> Result<(Vec<Piece>, Vec<Vec<u8>>), ReadError> {
+/// (`Pcdt`). У Word 6 (`word6` — `Some`) свойства старые, а куски — по
+/// байту на знак или, если `Some(true)`, в UTF-16.
+fn read_clx(clx: &[u8], word6: Option<bool>) -> Result<(Vec<Piece>, Vec<Vec<u8>>), ReadError> {
     let corrupt = || ReadError::Corrupt("испорчена таблица кусков текста".into());
     let mut prcs = Vec::new();
     let mut at = 0;
     while clx.get(at) == Some(&1) {
         let cb = usize::from(u16_at(clx, at + 1).ok_or_else(corrupt)?);
-        prcs.push(clx.get(at + 3..at + 3 + cb).ok_or_else(corrupt)?.to_vec());
+        let grpprl = clx.get(at + 3..at + 3 + cb).ok_or_else(corrupt)?;
+        prcs.push(if word6.is_some() {
+            word6::convert(grpprl)
+        } else {
+            grpprl.to_vec()
+        });
         at += 3 + cb;
     }
     if clx.get(at) != Some(&2) {
@@ -194,11 +277,16 @@ fn read_clx(clx: &[u8]) -> Result<(Vec<Piece>, Vec<Vec<u8>>), ReadError> {
     for (i, pcd) in pcds.iter().enumerate() {
         let fc = u32_at(pcd, 2).ok_or_else(corrupt)?;
         let prm = u16_at(pcd, 6).ok_or_else(corrupt)?;
-        let compressed = fc & 0x4000_0000 != 0;
+        let compressed = match word6 {
+            Some(unicode) => !unicode,
+            None => fc & 0x4000_0000 != 0,
+        };
         pieces.push(Piece {
             cp_start: cps[i],
             cp_end: cps[i + 1],
-            fc: if compressed {
+            fc: if word6.is_some() {
+                fc
+            } else if compressed {
                 (fc & !0x4000_0000) / 2
             } else {
                 fc
@@ -212,7 +300,13 @@ fn read_clx(clx: &[u8]) -> Result<(Vec<Piece>, Vec<Vec<u8>>), ReadError> {
 
 /// Знаки текста документа (первые `ccp_text`: основной текст, сноски,
 /// колонтитулы и т. д.). Номер в списке — позиция знака (`CP`).
-fn read_chars(word: &[u8], pieces: &[Piece], ccp_text: u32) -> Vec<Char> {
+/// Однобайтовые знаки переводит `decode` (байт и его смещение).
+fn read_chars(
+    word: &[u8],
+    pieces: &[Piece],
+    ccp_text: u32,
+    decode: &dyn Fn(u8, u32) -> u16,
+) -> Vec<Char> {
     let mut chars = Vec::new();
     for (index, piece) in pieces.iter().enumerate() {
         if piece.cp_start >= ccp_text {
@@ -225,7 +319,7 @@ fn read_chars(word: &[u8], pieces: &[Piece], ccp_text: u32) -> Vec<Char> {
                 let Some(&byte) = word.get(fc as usize) else {
                     break;
                 };
-                (cp1252(byte), fc)
+                (decode(byte, fc), fc)
             } else {
                 let fc = piece.fc + i * 2;
                 let Some(code) = u16_at(word, fc as usize) else {
@@ -245,26 +339,86 @@ fn read_chars(word: &[u8], pieces: &[Piece], ccp_text: u32) -> Vec<Char> {
 
 /// Знак Windows-1252 в UTF-16.
 fn cp1252(byte: u8) -> u16 {
+    decode_byte(byte, encoding_rs::WINDOWS_1252)
+}
+
+/// Однобайтовый знак в UTF-16. Служебные знаки (меньше 0x20) — как есть.
+fn decode_byte(byte: u8, encoding: &'static encoding_rs::Encoding) -> u16 {
+    if byte < 0x20 {
+        return u16::from(byte);
+    }
     let bytes = [byte];
-    let (text, _) = encoding_rs::WINDOWS_1252.decode_without_bom_handling(&bytes);
+    let (text, _) = encoding.decode_without_bom_handling(&bytes);
     text.encode_utf16().next().unwrap_or(u16::from(byte))
+}
+
+/// Шрифт знака по смещению `fc` (для кодировки текста Word 6): свой,
+/// из стиля абзаца (по цепочке «основан на») или шрифт по умолчанию.
+fn font_at(fc: u32, chpx: &[Range], papx: &[Range], sheet: &StyleSheet) -> u16 {
+    let font = |grpprl: &[u8]| {
+        sprms(grpprl)
+            .into_iter()
+            .rev()
+            .find(|(sprm, _)| *sprm == 0x4A4F)
+            .and_then(|(_, op)| u16_at(op, 0))
+    };
+    if let Some(font) = find(chpx, fc).and_then(|r| font(&r.grpprl)) {
+        return font;
+    }
+    let mut istd = find(papx, fc).map_or(0, |r| r.istd);
+    for _ in 0..16 {
+        let Some(style) = sheet.get(istd) else {
+            break;
+        };
+        if let Some(font) = font(&style.chpx) {
+            return font;
+        }
+        istd = style.based_on;
+    }
+    sheet.default_fonts[0]
 }
 
 /// Страницы оформления (`FKP`) знаков или абзацев по их таблице
 /// (`PlcBteChpx`/`PlcBtePapx`). Отрезки упорядочены по смещению.
-fn read_fkps(word: &[u8], plc_bytes: &[u8], paragraphs: bool) -> Vec<Range> {
-    let Some((_, pages)) = plc(plc_bytes, 4) else {
+///
+/// У Word 6 (`old`) номер страницы — два байта, запись абзаца — 7 байт,
+/// а таблица страниц бывает неполной: недостающие страницы идут подряд.
+fn read_fkps(word: &[u8], plc_bytes: &[u8], paragraphs: bool, old: Option<&Word6>) -> Vec<Range> {
+    let pn_size = if old.is_some() { 2 } else { 4 };
+    let Some((_, pages)) = plc(plc_bytes, pn_size) else {
         return Vec::new();
     };
+    let mut pns: Vec<u32> = pages
+        .iter()
+        .map(|page| match old {
+            Some(_) => u32::from(u16_at(page, 0).unwrap_or(0)),
+            None => u32_at(page, 0).unwrap_or(0) & 0x003F_FFFF,
+        })
+        .collect();
+    if let Some(old) = old {
+        let (first, count) = if paragraphs {
+            (old.pn_pap_first, old.cpn_pap)
+        } else {
+            (old.pn_chp_first, old.cpn_chp)
+        };
+        let mut next = pns.last().map_or(u32::from(first), |pn| pn + 1);
+        while pns.len() < usize::from(count) {
+            pns.push(next);
+            next += 1;
+        }
+    }
     let mut ranges = Vec::new();
-    for page in pages {
-        let pn = u32_at(page, 0).unwrap_or(0) & 0x003F_FFFF;
+    for pn in pns {
         let start = pn as usize * PAGE;
         let Some(fkp) = word.get(start..start + PAGE) else {
             continue;
         };
         let count = usize::from(fkp[PAGE - 1]);
-        let entry_size = if paragraphs { 13 } else { 1 };
+        let entry_size = match (paragraphs, old) {
+            (false, _) => 1,
+            (true, None) => 13,
+            (true, Some(_)) => 7,
+        };
         let entries = 4 * (count + 1);
         for i in 0..count {
             let (Some(fc_start), Some(fc_end), Some(&offset)) = (
@@ -278,10 +432,14 @@ fn read_fkps(word: &[u8], plc_bytes: &[u8], paragraphs: bool) -> Vec<Range> {
             let (istd, grpprl) = if offset == 0 {
                 (0, Vec::new())
             } else if paragraphs {
-                read_papx(fkp, at)
+                read_papx(fkp, at, old.is_some())
             } else {
                 let cb = usize::from(*fkp.get(at).unwrap_or(&0));
                 (0, fkp.get(at + 1..at + 1 + cb).unwrap_or_default().to_vec())
+            };
+            let grpprl = match old {
+                Some(_) => word6::convert(&grpprl),
+                None => grpprl,
             };
             ranges.push(Range {
                 start: fc_start,
@@ -295,10 +453,13 @@ fn read_fkps(word: &[u8], plc_bytes: &[u8], paragraphs: bool) -> Vec<Range> {
     ranges
 }
 
-/// Оформление абзаца в странице: номер стиля и свойства.
-fn read_papx(fkp: &[u8], at: usize) -> (u16, Vec<u8>) {
+/// Оформление абзаца в странице: номер стиля и свойства. В Word 6
+/// (`word6`) длина — ровно `2 × cw` байт.
+fn read_papx(fkp: &[u8], at: usize, word6: bool) -> (u16, Vec<u8>) {
     let cb = usize::from(*fkp.get(at).unwrap_or(&0));
-    let (start, len) = if cb == 0 {
+    let (start, len) = if word6 {
+        (at + 1, cb * 2)
+    } else if cb == 0 {
         let cb = usize::from(*fkp.get(at + 1).unwrap_or(&0));
         (at + 2, cb * 2)
     } else {
@@ -319,26 +480,29 @@ fn find(ranges: &[Range], fc: u32) -> Option<&Range> {
     ranges[..i].last().filter(|r| fc < r.end)
 }
 
-/// Разделы: последний знак каждого и его свойства.
-fn read_sections(word: &[u8], plc_bytes: &[u8]) -> Vec<(u32, Sep)> {
+/// Разделы: последний знак каждого и его свойства (`Sepx`; у Word 6
+/// — переведённые в свойства Word 97).
+fn read_sepxs(word: &[u8], plc_bytes: &[u8], word6: bool) -> Vec<(u32, Vec<u8>)> {
     let Some((cps, seds)) = plc(plc_bytes, 12) else {
         return Vec::new();
     };
     seds.iter()
         .enumerate()
         .map(|(i, sed)| {
-            let mut sep = Sep::default();
-            if let Some(fc) = u32_at(sed, 2).filter(|&fc| fc != u32::MAX)
-                && let Some(cb) = u16_at(word, fc as usize)
-            {
-                let start = fc as usize + 2;
-                if let Some(grpprl) = word.get(start..start + usize::from(cb)) {
-                    for (sprm, op) in sprms(grpprl) {
-                        apply_sep(&mut sep, sprm, op);
-                    }
-                }
-            }
-            (cps[i + 1], sep)
+            let grpprl = u32_at(sed, 2)
+                .filter(|&fc| fc != u32::MAX)
+                .and_then(|fc| {
+                    let cb = u16_at(word, fc as usize)?;
+                    let start = fc as usize + 2;
+                    word.get(start..start + usize::from(cb))
+                })
+                .unwrap_or_default();
+            let grpprl = if word6 {
+                word6::convert(grpprl)
+            } else {
+                grpprl.to_vec()
+            };
+            (cps[i + 1], grpprl)
         })
         .collect()
 }
@@ -512,6 +676,10 @@ impl Notes {
             ..Notes::default()
         };
 
+        if let Some(old) = &fib.word6 {
+            notes.read_word6_comments(fib, table, old);
+            return notes;
+        }
         // Примечания: ссылки с инициалами, номером автора и меткой
         // закладки, которая отмечает текст примечания.
         let owners = part(index::GRP_XST_ATN_OWNERS)
@@ -552,14 +720,49 @@ impl Notes {
     }
 }
 
-/// Строки `Xst` подряд: длина в знаках и знаки UTF-16.
+impl Notes {
+    /// Примечания Word 6: запись ссылки (`ATRD`) — 20 байт: инициалы
+    /// однобайтовой строкой и номер автора. Отмеченный текст не читается
+    /// (только место примечания).
+    fn read_word6_comments(&mut self, fib: &Fib, table: &[u8], old: &Word6) {
+        let owners = fib
+            .part(table, index::GRP_XST_ATN_OWNERS)
+            .map(|b| word6::pascal_list(b, old.encoding))
+            .unwrap_or_default();
+        let Some((cps, atrds)) = fib.part(table, index::PLCFAND_REF).and_then(|b| plc(b, 20))
+        else {
+            return;
+        };
+        for (i, (atrd, cp)) in atrds.iter().zip(cps).enumerate() {
+            let initials = word6::pascal_list(&atrd[..10], old.encoding)
+                .into_iter()
+                .next()
+                .unwrap_or_default();
+            let owner = u16_at(atrd, 10).unwrap_or(u16::MAX);
+            let author = owners.get(usize::from(owner)).cloned().unwrap_or_default();
+            self.comment_authors.push((author, initials));
+            self.comment_refs.push(cp);
+            self.comments.push((i.to_string(), cp..cp));
+        }
+    }
+}
+
 /// Закладки документа: имена из `SttbfBkmk`, начала из `PlcfBkf` (с
 /// номером конца) и концы из `PlcfBkl`.
 fn bookmarks(fib: &Fib, table: &[u8]) -> Vec<(String, std::ops::Range<u32>)> {
-    let names = fib
-        .part(table, index::STTBF_BKMK)
-        .map(sttb)
-        .unwrap_or_default();
+    let names: Vec<(String, Vec<u8>)> = match &fib.word6 {
+        Some(old) => fib
+            .part(table, index::STTBF_BKMK)
+            .map(|b| word6::sttb(b, old.encoding))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|name| (name, Vec::new()))
+            .collect(),
+        None => fib
+            .part(table, index::STTBF_BKMK)
+            .map(sttb)
+            .unwrap_or_default(),
+    };
     let Some((starts, entries)) = fib.part(table, index::PLCF_BKF).and_then(|b| plc(b, 4)) else {
         return Vec::new();
     };
@@ -579,6 +782,7 @@ fn bookmarks(fib: &Fib, table: &[u8]) -> Vec<(String, std::ops::Range<u32>)> {
         .collect()
 }
 
+/// Строки `Xst` подряд: длина в знаках и знаки UTF-16.
 fn xst_list(bytes: &[u8]) -> Vec<String> {
     let mut out = Vec::new();
     let mut at = 0;

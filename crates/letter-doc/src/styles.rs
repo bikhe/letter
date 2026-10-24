@@ -37,7 +37,9 @@ pub(crate) const ISTD_NIL: u16 = 0x0FFF;
 
 impl StyleSheet {
     /// Разбирает таблицу стилей. Испорченные стили пропускаются.
-    pub fn read(bytes: &[u8]) -> StyleSheet {
+    /// У Word 6 (`word6`) имена однобайтовые, один шрифт по умолчанию,
+    /// а свойства переводятся в свойства Word 97.
+    pub fn read(bytes: &[u8], word6: bool) -> StyleSheet {
         let mut sheet = StyleSheet::default();
         let Some(cb_stshi) = u16_at(bytes, 0).map(usize::from) else {
             return sheet;
@@ -46,7 +48,7 @@ impl StyleSheet {
         let count = u16_at(stshi, 0).unwrap_or(0);
         let base_size = usize::from(u16_at(stshi, 2).unwrap_or(10));
         for (i, slot) in sheet.default_fonts.iter_mut().enumerate() {
-            *slot = u16_at(stshi, 12 + i * 2).unwrap_or(0);
+            *slot = u16_at(stshi, if word6 { 12 } else { 12 + i * 2 }).unwrap_or(0);
         }
         let mut at = 2 + cb_stshi;
         for _ in 0..count {
@@ -58,7 +60,7 @@ impl StyleSheet {
             at += cb;
             sheet.styles.push(
                 std.filter(|s| !s.is_empty())
-                    .and_then(|s| read_std(s, base_size)),
+                    .and_then(|s| read_std(s, base_size, word6)),
             );
         }
         sheet
@@ -71,7 +73,7 @@ impl StyleSheet {
 }
 
 /// Один стиль (`STD`).
-fn read_std(std: &[u8], base_size: usize) -> Option<StyleEntry> {
+fn read_std(std: &[u8], base_size: usize, word6: bool) -> Option<StyleEntry> {
     let sti = u16_at(std, 0)? & 0x0FFF;
     let word = u16_at(std, 2)?;
     let kind = match word & 0x000F {
@@ -86,13 +88,18 @@ fn read_std(std: &[u8], base_size: usize) -> Option<StyleEntry> {
     let upx_count = usize::from(word & 0x000F);
     let next = word >> 4;
 
-    // Имя: длина в знаках UTF-16, знаки и завершающий ноль.
-    let mut at = base_size;
-    let len = usize::from(u16_at(std, at)?);
-    at += 2;
-    let units: Vec<u16> = (0..len).map_while(|i| u16_at(std, at + i * 2)).collect();
-    let name = String::from_utf16_lossy(&units);
-    at += (len + 1) * 2;
+    // Имя: длина в знаках UTF-16, знаки и завершающий ноль (у Word 6 —
+    // по байту на знак).
+    let (name, mut at) = if word6 {
+        crate::word6::style_name(std, base_size)?
+    } else {
+        let at = base_size;
+        let len = usize::from(u16_at(std, at)?);
+        let units: Vec<u16> = (0..len)
+            .map_while(|i| u16_at(std, at + 2 + i * 2))
+            .collect();
+        (String::from_utf16_lossy(&units), at + 2 + (len + 1) * 2)
+    };
 
     // Оформление (`UPX`): у стиля абзаца — абзац и знаки, у стиля
     // знаков — только знаки. Каждое выровнено на два байта.
@@ -107,6 +114,19 @@ fn read_std(std: &[u8], base_size: usize) -> Option<StyleEntry> {
         at += 2;
         upx.push(std.get(at..at + cb).unwrap_or_default().to_vec());
         at += cb;
+    }
+    if word6 {
+        for (i, grpprl) in upx.iter_mut().enumerate() {
+            // У оформления абзаца впереди номер стиля — его не трогаем.
+            let skip = if i == 0 && kind == Some(StyleKind::Paragraph) {
+                2.min(grpprl.len())
+            } else {
+                0
+            };
+            let converted = crate::word6::convert(&grpprl[skip..]);
+            grpprl.truncate(skip);
+            grpprl.extend(converted);
+        }
     }
     let (papx, chpx) = match (kind, upx.len()) {
         // У оформления абзаца впереди номер стиля — он не нужен.
@@ -235,7 +255,7 @@ mod tests {
         bytes.extend((std.len() as u16).to_le_bytes());
         bytes.extend(&std);
 
-        let sheet = StyleSheet::read(&bytes);
+        let sheet = StyleSheet::read(&bytes, false);
         assert_eq!(sheet.default_fonts, [1, 2, 3]);
         assert!(sheet.get(0).is_none());
         let style = sheet.get(1).unwrap();

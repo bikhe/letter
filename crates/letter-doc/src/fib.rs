@@ -9,6 +9,12 @@ const W_IDENT: u16 = 0xA5EC;
 /// Самая ранняя версия формата Word 97 (`nFib`). У Word 6/95 меньше.
 const NFIB_WORD97: u16 = 0x00C0;
 
+/// Версии формата Word 6 (`0x65`) и Word 95 (`0x68`), с запасом.
+const NFIB_WORD6: std::ops::RangeInclusive<u16> = 0x0065..=0x0069;
+
+/// Сколько пар «смещение — длина» в начале заголовка Word 6/95.
+const WORD6_PAIRS: usize = 38;
+
 /// Номера пар «смещение — длина» в `FibRgFcLcb97`, которые нам нужны.
 pub(crate) mod index {
     /// Таблица стилей (`STSH`).
@@ -111,25 +117,58 @@ impl Stories {
 /// Нужное из заголовка.
 #[derive(Debug, Clone)]
 pub(crate) struct Fib {
-    /// Таблицы лежат в потоке `1Table` (иначе `0Table`).
-    pub table_1: bool,
     /// Сколько знаков в каждой части текста.
     pub stories: Stories,
     /// Пары «смещение в табличном потоке — длина».
     pub fc_lcb: Vec<(u32, u32)>,
+    /// Особенности Word 6/95; `None` — Word 97 и новее.
+    pub word6: Option<Word6>,
+}
+
+/// Что есть только в заголовке Word 6/95.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Word6 {
+    /// Кодировка текста: в Word 6/95 по байту на знак, кодовая страница
+    /// — по языку документа.
+    pub encoding: &'static encoding_rs::Encoding,
+    /// Начало текста в потоке (`fcMin`), если нет таблицы кусков.
+    pub fc_min: u32,
+    /// Куски текста — в UTF-16 (признак `fExtChar`; так пишут
+    /// некоторые программы), иначе по байту на знак.
+    pub unicode: bool,
+    /// Первая страница оформления знаков и абзацев и их число
+    /// (`pnChpFirst`, `pnPapFirst`, `cpnBteChp`, `cpnBtePap`): таблица
+    /// страниц бывает неполной, остальные страницы идут подряд.
+    pub pn_chp_first: u16,
+    pub pn_pap_first: u16,
+    pub cpn_chp: u16,
+    pub cpn_pap: u16,
+}
+
+/// Документ ли это Word 6/95 (по версии в заголовке).
+pub(crate) fn is_word6(stream: &[u8]) -> bool {
+    u16_at(stream, 2).is_some_and(|n| NFIB_WORD6.contains(&n))
 }
 
 impl Fib {
     /// Разбирает заголовок в начале потока `WordDocument`.
     pub fn read(stream: &[u8]) -> Result<Fib, ReadError> {
         let short = || ReadError::Corrupt("короткий заголовок".into());
-        if u16_at(stream, 0).ok_or_else(short)? != W_IDENT {
+        let ident = u16_at(stream, 0).ok_or_else(short)?;
+        let n_fib = u16_at(stream, 2).ok_or_else(short)?;
+        // У Word 6/95 признак свой (0xA5DC; 0xA699 пишут и другие
+        // программы).
+        let word6 = NFIB_WORD6.contains(&n_fib) && [0xA5DC, 0xA699, W_IDENT].contains(&ident);
+        if ident != W_IDENT && !word6 {
             return Err(ReadError::NotADoc);
         }
-        let n_fib = u16_at(stream, 2).ok_or_else(short)?;
         let flags = u16_at(stream, 10).ok_or_else(short)?;
+        // Зашифрованный документ сюда попадает уже расшифрованным.
         if flags & 0x0100 != 0 {
             return Err(ReadError::Encrypted);
+        }
+        if word6 {
+            return Fib::read_word6(stream);
         }
         if n_fib < NFIB_WORD97 {
             return Err(ReadError::OldVersion);
@@ -160,9 +199,52 @@ impl Fib {
             .collect::<Option<Vec<_>>>()
             .ok_or_else(short)?;
         Ok(Fib {
-            table_1: flags & 0x0200 != 0,
             stories,
             fc_lcb,
+            word6: None,
+        })
+    }
+
+    /// Заголовок Word 6/95: всё на постоянных местах, таблицы лежат
+    /// в том же потоке `WordDocument`.
+    fn read_word6(stream: &[u8]) -> Result<Fib, ReadError> {
+        let short = || ReadError::Corrupt("короткий заголовок".into());
+        let ccp = |i: usize| u32_at(stream, 0x34 + i * 4).ok_or_else(short);
+        let stories = Stories {
+            text: ccp(0)?,
+            footnotes: ccp(1)?,
+            headers: ccp(2)?,
+            macros: ccp(3)?,
+            comments: ccp(4)?,
+            endnotes: ccp(5)?,
+        };
+        let pair = |at: usize| Some((u32_at(stream, at)?, u32_at(stream, at + 4)?));
+        // Пары 0–37 — с 0x58; дальше четыре слова о страницах оформления
+        // и снова пары с теми же номерами, что в Word 97 (нужны до 47:
+        // закладки примечаний и концевые сноски). На местах 40 и 41
+        // в Word 97 фигуры, а в Word 6 — пустые поля.
+        let fc_lcb = (0..WORD6_PAIRS)
+            .map(|i| pair(0x58 + i * 8))
+            .chain((WORD6_PAIRS..=47).map(|i| match i {
+                40 | 41 => Some((0, 0)),
+                _ => pair(0x192 + (i - WORD6_PAIRS) * 8),
+            }))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(short)?;
+        let at = 0x58 + WORD6_PAIRS * 8 + 2;
+        let word = |i: usize| u16_at(stream, at + i * 2).ok_or_else(short);
+        Ok(Fib {
+            stories,
+            fc_lcb,
+            word6: Some(Word6 {
+                encoding: encoding(u16_at(stream, 6).unwrap_or(0)),
+                fc_min: u32_at(stream, 0x18).ok_or_else(short)?,
+                unicode: u16_at(stream, 10).is_some_and(|flags| flags & 0x1000 != 0),
+                pn_chp_first: word(0)?,
+                pn_pap_first: word(1)?,
+                cpn_chp: word(2)?,
+                cpn_pap: word(3)?,
+            }),
         })
     }
 
@@ -184,6 +266,33 @@ impl Fib {
             return None;
         }
         table.get(fc as usize..)
+    }
+}
+
+/// Кодовая страница текста по языку (`lid`) документа Word 6/95.
+fn encoding(lid: u16) -> &'static encoding_rs::Encoding {
+    use encoding_rs::*;
+    match (lid & 0x03FF, lid) {
+        // Сербский кириллицей.
+        (0x1A, 0x0C1A) => WINDOWS_1251,
+        // Русский, украинский, белорусский, болгарский, македонский,
+        // казахский, киргизский, татарский, монгольский.
+        (0x19 | 0x22 | 0x23 | 0x02 | 0x2F | 0x3F | 0x40 | 0x44 | 0x50, _) => WINDOWS_1251,
+        // Польский, чешский, словацкий, венгерский, словенский,
+        // хорватский, румынский, албанский.
+        (0x15 | 0x05 | 0x1B | 0x0E | 0x24 | 0x1A | 0x18 | 0x1C, _) => WINDOWS_1250,
+        (0x08, _) => WINDOWS_1253,
+        (0x1F, _) => WINDOWS_1254,
+        (0x0D, _) => WINDOWS_1255,
+        (0x01, _) => WINDOWS_1256,
+        (0x25..=0x27, _) => WINDOWS_1257,
+        (0x2A, _) => WINDOWS_1258,
+        (0x1E, _) => WINDOWS_874,
+        (0x11, _) => SHIFT_JIS,
+        (0x12, _) => EUC_KR,
+        (0x04, 0x0404 | 0x0C04 | 0x1404) => BIG5,
+        (0x04, _) => GBK,
+        _ => WINDOWS_1252,
     }
 }
 
@@ -256,8 +365,17 @@ mod tests {
         assert!(matches!(Fib::read(&[]), Err(ReadError::Corrupt(_))));
         let mut old = vec![0; 600];
         old[..2].copy_from_slice(&W_IDENT.to_le_bytes());
-        old[2..4].copy_from_slice(&0x0065u16.to_le_bytes());
+        // Word 2.0 не читается, а Word 6 — да.
+        old[2..4].copy_from_slice(&0x002Du16.to_le_bytes());
         assert!(matches!(Fib::read(&old), Err(ReadError::OldVersion)));
+        old[2..4].copy_from_slice(&0x0065u16.to_le_bytes());
+        old[6..8].copy_from_slice(&0x0419u16.to_le_bytes());
+        assert!(is_word6(&old));
+        let fib = Fib::read(&old).unwrap();
+        assert_eq!(fib.word6.unwrap().encoding, encoding_rs::WINDOWS_1251);
+        assert_eq!(encoding(0x0409), encoding_rs::WINDOWS_1252);
+        assert_eq!(encoding(0x041A), encoding_rs::WINDOWS_1250);
+        assert_eq!(encoding(0x0C1A), encoding_rs::WINDOWS_1251);
         old[10] = 0;
         old[11] = 0x01;
         assert!(matches!(Fib::read(&old), Err(ReadError::Encrypted)));

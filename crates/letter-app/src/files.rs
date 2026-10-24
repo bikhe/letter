@@ -144,16 +144,23 @@ pub fn read(path: &Path) -> Result<Document, String> {
     }
 }
 
-/// Зашифрован ли файл паролем на открытие (.docx и его разновидности).
+/// Зашифрован ли файл паролем на открытие (.docx и его разновидности,
+/// .doc).
 pub fn is_encrypted(path: &Path) -> bool {
-    FileFormat::from_path(path) == Some(FileFormat::Docx)
-        && fs::read(path).is_ok_and(|data| letter_docx::is_encrypted(&data))
+    match FileFormat::from_path(path) {
+        Some(FileFormat::Docx) => fs::read(path).is_ok_and(|data| letter_docx::is_encrypted(&data)),
+        Some(FileFormat::Doc) => fs::read(path).is_ok_and(|data| letter_doc::is_encrypted(&data)),
+        _ => false,
+    }
 }
 
 /// Читает документ, зашифрованный паролем (см. [`is_encrypted`]).
 pub fn read_with_password(path: &Path, password: &str) -> Result<Document, String> {
     let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
     let data = fs::read(path).map_err(|e| fail(&e))?;
+    if FileFormat::from_path(path) == Some(FileFormat::Doc) {
+        return letter_doc::read_with_password(&data, password).map_err(|e| fail(&e));
+    }
     letter_docx::read_bytes_with_password(&data, password).map_err(|e| fail(&e))
 }
 
@@ -516,6 +523,13 @@ pub mod tests {
         assert!(read_with_password(&path, "не тот").is_err());
         let back = read_with_password(&path, "пароль").unwrap();
         assert_eq!(back.plain_text().trim(), "Привет, мир\nвторой");
+        // Зашифрованный .doc (его сохранил LibreOffice) тоже спрашивает
+        // пароль.
+        let doc = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/doc/encrypted-rc4.doc");
+        assert!(is_encrypted(&doc) && read(&doc).is_err());
+        assert!(read_with_password(&doc, "не тот").is_err());
+        assert!(read_with_password(&doc, "пароль").is_ok());
         // В другие форматы пароль не пишется.
         let rtf = dir.join("тайна.rtf");
         write(&sample(), &rtf, Some("пароль")).unwrap();

@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use letter_doc::{ReadError, is_doc, read, read_file};
+use letter_doc::{ReadError, is_doc, is_encrypted, read, read_file, read_with_password};
 use letter_model::{
     Block, Border, Color, Document, HeaderFooter, HeaderFooters, Inline, ListCounters, NoteKind,
     Paragraph, Picture, RunContent, StyleKind, Table, Twips,
@@ -551,6 +551,51 @@ fn pictures_survive_saving_as_docx() {
         );
         assert_eq!(a.anchor, b.anchor);
     }
+}
+
+#[test]
+fn encrypted_documents_open_with_password() {
+    // RC4 — файл LibreOffice, RC4 CryptoAPI и XOR — сделаны программой
+    // `tests/fixtures/doc/encrypt` из image.doc.
+    let plain = doc("image");
+    for (name, password) in [
+        ("encrypted-rc4", "пароль"),
+        ("encrypted-cryptoapi", "пароль"),
+        ("encrypted-xor", "secret12"),
+    ] {
+        let bytes = std::fs::read(dir().join(format!("doc/{name}.doc"))).unwrap();
+        assert!(is_doc(&bytes) && is_encrypted(&bytes), "{name}");
+        assert!(matches!(read(&bytes), Err(ReadError::Encrypted)), "{name}");
+        assert!(
+            matches!(
+                read_with_password(&bytes, "не тот"),
+                Err(ReadError::WrongPassword)
+            ),
+            "{name}"
+        );
+        let doc = read_with_password(&bytes, password).unwrap_or_else(|e| panic!("{name}: {e}"));
+        assert_eq!(
+            lines(&doc.plain_text()),
+            lines(&plain.plain_text()),
+            "{name}"
+        );
+        // Картинка из потока `Data` тоже расшифрована.
+        let (got, expected) = (pictures(&doc), pictures(&plain));
+        assert_eq!(got.len(), expected.len(), "{name}");
+        for (g, e) in got.iter().zip(&expected) {
+            assert_eq!(g.image, e.image, "{name}");
+        }
+        // Испорченный файл с паролем — ошибка, а не падение.
+        for at in (0..bytes.len()).step_by(89) {
+            let mut broken = bytes.clone();
+            broken[at] ^= 0xA5;
+            let _ = read_with_password(&broken, password);
+        }
+    }
+    let plain = std::fs::read(dir().join("doc/image.doc")).unwrap();
+    assert!(!is_encrypted(&plain) && !is_encrypted(b"not a doc"));
+    // Незашифрованный документ с паролем читается как обычно.
+    assert!(read_with_password(&plain, "пароль").is_ok());
 }
 
 #[test]

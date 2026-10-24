@@ -1,4 +1,5 @@
-//! Чтение старого двоичного формата .doc (Word 97–2003, MS-DOC).
+//! Чтение старого двоичного формата .doc (Word 97–2003, MS-DOC, а также
+//! Word 6.0 и Word 95).
 //!
 //! Файл .doc — составной файл OLE. В потоке `WordDocument` лежат
 //! заголовок (FIB) и сам текст, в потоке `0Table` или `1Table` —
@@ -12,9 +13,19 @@
 //! и колонок, поля (код и результат), таблицы с ширинами столбцов,
 //! разделы с размером листа, полями, началом и колонками.
 //!
-//! Пока не читаются: колонтитулы, сноски, примечания, списки (номера),
-//! картинки и надписи, границы и заливка, исправления; старые форматы
-//! Word 6/95 и шифрованные .doc.
+//! Читаются и колонтитулы, сноски, примечания, списки, границы и
+//! заливка, картинки, гиперссылки, закладки и сведения о документе.
+//!
+//! Документы Word 6.0 и Word 95 читаются так же, но в них нет
+//! нумерованных списков нового вида, картинок и рисунков: пока
+//! читаются текст, оформление, стили, разделы, колонтитулы, сноски,
+//! таблицы и закладки.
+//!
+//! Пока не читаются: фигуры и надписи, исправления; файлы Word 2.0 и
+//! старше.
+//!
+//! Документ с паролем на открытие (RC4, RC4 CryptoAPI или XOR)
+//! читается функцией [`read_with_password`].
 //!
 //! ```no_run
 //! let doc = letter_doc::read_file("старый.doc")?;
@@ -22,6 +33,7 @@
 //! # Ok::<(), letter_doc::ReadError>(())
 //! ```
 
+mod crypto;
 mod fib;
 mod links;
 mod lists;
@@ -30,6 +42,7 @@ mod properties;
 mod reader;
 mod sprm;
 mod styles;
+mod word6;
 
 use std::path::Path;
 
@@ -46,12 +59,16 @@ pub enum ReadError {
     /// потока `WordDocument`).
     #[error("это не документ Word 97–2003")]
     NotADoc,
-    /// Документ старого Word 6 или Word 95.
-    #[error("документ Word 6/95 пока не поддерживается")]
+    /// Документ Word 2.0 или ещё более старой версии.
+    #[error("документ слишком старой версии Word (до Word 6) не поддерживается")]
     OldVersion,
-    /// Документ зашифрован паролем.
-    #[error("документ .doc защищён паролем; такие пока не открываются")]
+    /// Документ зашифрован: чтобы его открыть, нужен пароль
+    /// (см. [`read_with_password`]).
+    #[error("документ защищён паролем")]
     Encrypted,
+    /// Пароль не подходит.
+    #[error("неверный пароль")]
+    WrongPassword,
     /// Файл повреждён.
     #[error("файл .doc повреждён: {0}")]
     Corrupt(String),
@@ -61,7 +78,26 @@ pub enum ReadError {
 ///
 /// Битый файл никогда не роняет программу: функция возвращает ошибку.
 pub fn read(data: &[u8]) -> Result<Document, ReadError> {
-    reader::read(data)
+    reader::read(data, None)
+}
+
+/// Читает документ .doc, зашифрованный паролем `password` (см.
+/// [`is_encrypted`]). Незашифрованный документ читается как обычно.
+///
+/// Неверный пароль даёт [`ReadError::WrongPassword`].
+pub fn read_with_password(data: &[u8], password: &str) -> Result<Document, ReadError> {
+    reader::read(data, Some(password))
+}
+
+/// Зашифрован ли документ .doc паролем на открытие.
+pub fn is_encrypted(data: &[u8]) -> bool {
+    let Ok(mut file) = reader::open(data) else {
+        return false;
+    };
+    let mut head = [0u8; 12];
+    file.open_stream("/WordDocument")
+        .and_then(|mut stream| std::io::Read::read_exact(&mut stream, &mut head))
+        .is_ok_and(|()| crypto::is_encrypted(&head))
 }
 
 /// Читает файл .doc.

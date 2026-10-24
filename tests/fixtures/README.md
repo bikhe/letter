@@ -102,3 +102,45 @@ soffice --headless --convert-to doc:"MS Word 97" ../docx/имя.docx
 ```
 
 Распространяются по лицензии проекта (MIT).
+
+### Зашифрованные (`doc/encrypted-*.doc`)
+
+Копии `image.doc` с паролем на открытие:
+
+- `encrypted-rc4.doc` — способ RC4 (как в Word 97/2000), пароль «пароль».
+  Сохранён LibreOffice из `docx/image.docx` (параметр `Password` при
+  сохранении в фильтр `MS Word 97`).
+- `encrypted-cryptoapi.doc` — RC4 CryptoAPI (как в Word 2002 и новее),
+  пароль «пароль»;
+- `encrypted-xor.doc` — XOR (совместимый с Word 6/95), пароль `secret12`.
+
+Последние два LibreOffice делать не умеет; их сделала маленькая программа
+[`doc/encrypt`](doc/encrypt) по описанию MS-OFFCRYPTO (CryptoAPI проверен
+расшифровкой в [msoffcrypto-tool](https://github.com/nolze/msoffcrypto-tool),
+ключ XOR — им же):
+
+```sh
+cd tests/fixtures/doc/encrypt
+cargo run -- ../image.doc ..
+```
+
+Распространяются по лицензии проекта (MIT).
+
+### Word 6.0 и Word 95 (`doc/word6/`)
+
+Файлы из тестов проекта [Apache POI](https://github.com/apache/poi)
+(`test-data/document/`), лицензия Apache 2.0 (текст лицензии —
+[`LICENSE-2.0.txt`](doc/word6/LICENSE-2.0.txt), уведомление проекта —
+[`NOTICE-apache-poi.txt`](doc/word6/NOTICE-apache-poi.txt)). Ожидаемый
+текст в тестах сверен с LibreOffice.
+
+| Файл | Исходное имя в Apache POI | Что в нём |
+|------|---------------------------|-----------|
+| `word6.doc` | `Word6.doc` | Одна строка текста, Word 6 |
+| `formatting.doc` | `Word95.doc` | Четыре абзаца, красный и синий полужирный текст |
+| `sections.doc` | `Word6_sections.doc` | Три раздела |
+| `headers.doc` | `Word6_sections2.doc` | Word 95: лист A4, полужирные заголовки по центру, нижний колонтитул с полем |
+| `czech.doc` | `Bug60936.doc` | Чешский текст (центральноевропейская кодировка шрифта) |
+| `russian.doc` | `Bug60942b.doc` | Русский текст (кириллица шрифта) |
+| `tables.doc` | `Bug49933.doc` | Word 95: прайс-лист на русском, четыре таблицы |
+| `unicode.doc` | `Bug51944.doc` | Записан не Word: куски текста в UTF-16 (признак `fExtChar`) |
